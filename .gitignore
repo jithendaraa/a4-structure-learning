@@ -1,0 +1,10 @@
+__pycache__/
+wandb/
+slot_attention/
+*.out
+logs/
+out/
+vcn_pytorch/
+core*
+jax_setup/tmp/
+dibs_repo/
