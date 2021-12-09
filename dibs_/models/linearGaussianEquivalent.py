@@ -267,6 +267,8 @@ class BGeJAX:
         """
         
         N, d = data.shape        
+
+        # intervention
         if interv_targets is None:
             interv_targets = jnp.zeros(d).astype(bool)
 
@@ -297,11 +299,17 @@ class BGeJAX:
         )
 
         # compute number of parents for each node
-        n_parents_all = w.sum(axis=0).astype(jnp.int32)
+        n_parents_all = w.sum(axis=0)
 
         # sum scores for all nodes
-        res = self.eltwise_log_marginal_likelihood_given_g_single(jnp.arange(d), n_parents_all, R, w, data, log_gamma_terms)
-        return jnp.sum(jnp.where(interv_targets, 0.0, res))
+        return jnp.sum(
+            jnp.where(
+                interv_targets,
+                0.0,
+                self.eltwise_log_marginal_likelihood_given_g_single(jnp.arange(
+                    d), n_parents_all, R, w, data, log_gamma_terms)
+            )
+        )
 
         # prev code without interventions
         # return jnp.sum(self.log_marginal_likelihood_given_g_j(jnp.arange(d), n_parents_all, R, w, data, log_gamma_terms))

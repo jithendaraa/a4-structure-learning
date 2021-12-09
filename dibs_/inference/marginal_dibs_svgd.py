@@ -6,7 +6,6 @@ from jax import jit, vmap, random, grad
 from jax.experimental import optimizers
 
 from dibs.inference.dibs import DiBS
-from time import time
 
 
 class MarginalDiBS(DiBS):
@@ -34,9 +33,10 @@ class MarginalDiBS(DiBS):
         latent_prior_std (float): standard deviation of Gaussian prior over Z; defaults to 1/sqrt(k)
     """
 
+
     def __init__(self, *, kernel, target_log_prior, target_log_marginal_prob, alpha_linear, beta_linear=1.0, tau=1.0,
                  optimizer=dict(name='rmsprop', stepsize=0.005), n_grad_mc_samples=128, n_acyclicity_mc_samples=32, 
-                 grad_estimator_z='reparam', score_function_baseline=0.0,
+                 grad_estimator_z='score', score_function_baseline=0.0,
                  latent_prior_std=None, verbose=False):
 
         """
@@ -44,7 +44,7 @@ class MarginalDiBS(DiBS):
         we define a marginal log likelihood variant with dummy parameter inputs. This will allow using the same 
         gradient estimator functions for both inference cases.
         """
-        target_log_marginal_prob_extra_args = lambda single_z, single_theta, subk, data: target_log_marginal_prob(single_z, data)
+        target_log_marginal_prob_extra_args = lambda single_z, single_theta, rng: target_log_marginal_prob(single_z)
 
         super(MarginalDiBS, self).__init__(
             target_log_prior=target_log_prior,
@@ -62,10 +62,7 @@ class MarginalDiBS(DiBS):
 
         self.kernel = kernel
         self.optimizer = optimizer
-        self.opt = None
-        self.opt_init  = None
-        self.get_params = None
-        self.opt_update = None
+
 
     def sample_initial_random_particles(self, *, key, n_particles, n_vars, n_dim=None):
         """
@@ -81,7 +78,8 @@ class MarginalDiBS(DiBS):
             z: batch of latent tensors [n_particles, d, k, 2]    
         """
         # default full rank
-        if n_dim is None:   n_dim = n_vars 
+        if n_dim is None:
+            n_dim = n_vars 
         
         # like prior
         std = self.latent_prior_std or (1.0 / jnp.sqrt(n_dim))
@@ -156,6 +154,7 @@ class MarginalDiBS(DiBS):
 
         Returns
             transform vector of shape [d, k, 2] for the Z particle being updated        
+
         """
     
         # compute terms in sum
@@ -174,9 +173,10 @@ class MarginalDiBS(DiBS):
         return vmap(self.z_update, (0, 1, None, None, None, None), 0)(*args)
 
 
+
     # this is the crucial @jit
     @functools.partial(jit, static_argnums=(0,))
-    def svgd_step(self, opt_state_z, key, sf_baseline, t, data=None):
+    def svgd_step(self, opt_state_z, key, t, sf_baseline):
         """
         Performs a single SVGD step in the DiBS framework, updating all Z particles jointly.
 
@@ -189,36 +189,42 @@ class MarginalDiBS(DiBS):
         Returns:
             the updated inputs
         """
+     
         z = self.get_params(opt_state_z) # [n_particles, d, k, 2]
-        
         n_particles = z.shape[0]
-        h = self.kernel.h   # make sure same bandwith is used for all calls to k(x, x') (in case e.g. the median heuristic is applied)
 
-        # ? d/dz log p(D | z) grad log likelihood
+        # make sure same bandwith is used for all calls to k(x, x') (in case e.g. the median heuristic is applied)
+        h = self.kernel.h
+
+        # d/dz log p(D | z)
         key, *batch_subk = random.split(key, n_particles + 1) 
-        dz_log_likelihood, sf_baseline = self.eltwise_grad_z_likelihood(z, None, sf_baseline, t, jnp.array(batch_subk), data)
+        print("Taking SVGD step")
+        dz_log_likelihood, sf_baseline = self.eltwise_grad_z_likelihood(z, None, sf_baseline, t, jnp.array(batch_subk))
         # here `None` is a placeholder for theta (in the joint inference case) 
         # since this is an inherited function from the general `DiBS` class
-
-        # ? d/dz log p(z) (acyclicity) grad log PRIOR
+        print("DONE")
+        # d/dz log p(z) (acyclicity)
         key, *batch_subk = random.split(key, n_particles + 1)
         dz_log_prior = self.eltwise_grad_latent_prior(z, jnp.array(batch_subk), t)
-        
-        # ? d/dz log p(z, D) = d/dz log p(z)  + log p(D | z) 
+
+        # d/dz log p(z, D) = d/dz log p(z)  + log p(D | z) 
         dz_log_prob = dz_log_prior + dz_log_likelihood
         
-        kxx = self.f_kernel_mat(z, z, h, t) # ? k(z, z) for all particles
+        # k(z, z) for all particles
+        kxx = self.f_kernel_mat(z, z, h, t)
+
         # transformation phi() applied in batch to each particle individually
         phi_z = self.parallel_update_z(z, kxx, z, dz_log_prob, h, t)
 
         # apply transformation
         # `x += stepsize * phi`; the phi returned is negated for SVGD
         opt_state_z = self.opt_update(t, phi_z, opt_state_z)
+
         return opt_state_z, key, sf_baseline
     
     
 
-    def sample_particles(self, *, n_steps, init_particles_z, key, opt_state_z, sf_baseline, callback=None, callback_every=0, data=None, start=0):
+    def sample_particles(self, *, n_steps, init_particles_z, key, callback=None, callback_every=0):
         """
         Deterministically transforms particles to minimize KL to target using SVGD
 
@@ -233,34 +239,52 @@ class MarginalDiBS(DiBS):
             `n_particles` samples that approximate the DiBS target density
             particles_z: [n_particles, d, k, 2]
         """
+
         z = init_particles_z
-        n_particles, _, n_dim, _ = z.shape  
-        if sf_baseline is None: sf_baseline = jnp.zeros(n_particles)
-        if self.latent_prior_std is None: self.latent_prior_std = 1.0 / jnp.sqrt(n_dim)
+           
+        # initialize score function baseline (one for each particle)
+        n_particles, _, n_dim, _ = z.shape
+        sf_baseline = jnp.zeros(n_particles)
+
+        if self.latent_prior_std is None:
+            self.latent_prior_std = 1.0 / jnp.sqrt(n_dim)
+
 
         # init optimizer
-        if self.opt is None:
-            if self.optimizer['name'] == 'gd':          opt = optimizers.sgd(self.optimizer['stepsize']/ 10.0) # comparable scale for tuning
-            elif self.optimizer['name'] == 'momentum':  opt = optimizers.momentum(self.optimizer['stepsize'])
-            elif self.optimizer['name'] == 'adagrad':   opt = optimizers.adagrad(self.optimizer['stepsize'])
-            elif self.optimizer['name'] == 'adam':      opt = optimizers.adam(self.optimizer['stepsize'])
-            elif self.optimizer['name'] == 'rmsprop':   opt = optimizers.rmsprop(self.optimizer['stepsize'])
-            else:   raise ValueError()
-            self.opt_init, self.opt_update, self.get_params = opt
-            self.get_params = jit(self.get_params)
-            opt_state_z = self.opt_init(z)
-            self.opt = opt
+        if self.optimizer['name'] == 'gd':
+            opt = optimizers.sgd(self.optimizer['stepsize']/ 10.0) # comparable scale for tuning
+        elif self.optimizer['name'] == 'momentum':
+            opt = optimizers.momentum(self.optimizer['stepsize'])
+        elif self.optimizer['name'] == 'adagrad':
+            opt = optimizers.adagrad(self.optimizer['stepsize'])
+        elif self.optimizer['name'] == 'adam':
+            opt = optimizers.adam(self.optimizer['stepsize'])
+        elif self.optimizer['name'] == 'rmsprop':
+            opt = optimizers.rmsprop(self.optimizer['stepsize'])
+        else:
+            raise ValueError()
+        
+        opt_init, self.opt_update, get_params = opt
+        self.get_params = jit(get_params)
+        opt_state_z = opt_init(z)
 
         """Execute particle update steps for all particles in parallel using `vmap` functions"""
-        it = tqdm.tqdm(jnp.arange(start, start+n_steps), desc='DiBS', disable=not self.verbose)
-
+        it = tqdm.tqdm(range(n_steps), desc='DiBS', disable=not self.verbose)
         for t in it:
-            opt_state_z, key, sf_baseline = self.svgd_step(opt_state_z, key, sf_baseline, t, data)     # perform one SVGD step (compiled with @jit)
+
+            # perform one SVGD step (compiled with @jit)
+            opt_state_z, key, sf_baseline  = self.svgd_step(
+                opt_state_z, key, t, sf_baseline)
+
             # callback
             if callback and callback_every and (((t+1) % callback_every == 0) or (t == (n_steps - 1))):
                 z = self.get_params(opt_state_z)
-                callback(dibs=self, t=t, zs=z)
+                callback(
+                    dibs=self,
+                    t=t,
+                    zs=z,
+                )
 
         # return transported particles
         z_final = self.get_params(opt_state_z)
-        return z_final, opt_state_z, sf_baseline
+        return z_final

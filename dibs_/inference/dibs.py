@@ -263,7 +263,7 @@ class DiBS:
     Estimators for scores of log p(theta, D | Z) 
     """
 
-    def eltwise_log_joint_prob(self, gs, single_theta, rng, data=None):
+    def eltwise_log_joint_prob(self, gs, single_theta, rng):
         """
         log p(data | G, theta) batched over samples of G
 
@@ -276,11 +276,11 @@ class DiBS:
             batch of logprobs [n_graphs, ]
         """
 
-        return vmap(self.target_log_joint_prob, (0, None, None, None), 0)(gs, single_theta, rng, data)
+        return vmap(self.target_log_joint_prob, (0, None, None), 0)(gs, single_theta, rng)
 
     
 
-    def log_joint_prob_soft(self, single_z, single_theta, eps, t, subk, data):
+    def log_joint_prob_soft(self, single_z, single_theta, eps, t, subk):
         """
         This is the composition of 
             log p(theta, D | G) 
@@ -299,7 +299,7 @@ class DiBS:
 
         """
         soft_g_sample = self.particle_to_soft_graph(single_z, eps, t)
-        return self.target_log_joint_prob(soft_g_sample, single_theta, subk, data)
+        return self.target_log_joint_prob(soft_g_sample, single_theta, subk)
     
 
     #
@@ -307,7 +307,7 @@ class DiBS:
     # (i.e. w.r.t the latent embeddings Z for graph G)
     #
 
-    def eltwise_grad_z_likelihood(self,  zs, thetas, baselines, t, subkeys, data=None):
+    def eltwise_grad_z_likelihood(self,  zs, thetas, baselines, t, subkeys):
         """
         Computes batch of estimators for score
             
@@ -336,11 +336,11 @@ class DiBS:
             raise ValueError(f'Unknown gradient estimator `{self.grad_estimator_z}`')
 
         # vmap
-        return vmap(grad_z_likelihood, (0, 0, 0, None, 0, None), (0, 0))(zs, thetas, baselines, t, subkeys, data)
+        return vmap(grad_z_likelihood, (0, 0, 0, None, 0), (0, 0))(zs, thetas, baselines, t, subkeys)
 
 
 
-    def grad_z_likelihood_score_function(self, single_z, single_theta, single_sf_baseline, t, subk, data=None):
+    def grad_z_likelihood_score_function(self, single_z, single_theta, single_sf_baseline, t, subk):
         """
         Score function estimator (aka REINFORCE) for the score d/dZ log p(theta, D | Z) 
         This does not use d/dG log p(theta, D | G) and is hence applicable when not defined.
@@ -361,6 +361,7 @@ class DiBS:
         # [d, d]
         p = self.edge_probs(single_z, t)
         n_vars, n_dim = single_z.shape[0:2]
+        print(p, n_vars, n_dim, self.n_grad_mc_samples)
 
         # [n_grad_mc_samples, d, d]
         subk, subk_ = random.split(subk)
@@ -372,7 +373,7 @@ class DiBS:
 
         # [n_grad_mc_samples, ] 
         subk, subk_ = random.split(subk)
-        logprobs_numerator = self.eltwise_log_joint_prob(g_samples, single_theta, subk_, data)
+        logprobs_numerator = self.eltwise_log_joint_prob(g_samples, single_theta, subk_)
         logprobs_denominator = logprobs_numerator
 
         # variance_reduction
@@ -404,13 +405,11 @@ class DiBS:
         single_sf_baseline = (self.score_function_baseline * logprobs_numerator.mean(0) +
                             (1 - self.score_function_baseline) * single_sf_baseline)
 
-        print("YEAH")
-
         return stable_sf_grad_shaped, single_sf_baseline
         
 
 
-    def grad_z_likelihood_gumbel(self, single_z, single_theta, single_sf_baseline, t, subk, data=None):
+    def grad_z_likelihood_gumbel(self, single_z, single_theta, single_sf_baseline, t, subk):
         """
         Reparameterization estimator for the score
 
@@ -444,7 +443,7 @@ class DiBS:
         subk, subk_ = random.split(subk)
        
         # [d, k, 2], [d, d], [n_grad_mc_samples, d, d], [1,], [1,] -> [n_grad_mc_samples]
-        logprobs_numerator = vmap(self.log_joint_prob_soft, (None, None, 0, None, None, None), 0)(single_z, single_theta, eps, t, subk_, data) 
+        logprobs_numerator = vmap(self.log_joint_prob_soft, (None, None, 0, None, None), 0)(single_z, single_theta, eps, t, subk_) 
         logprobs_denominator = logprobs_numerator
 
         # [n_grad_mc_samples, d, k, 2]
@@ -452,7 +451,7 @@ class DiBS:
         # use the same minibatch of data as for other log prob evaluation (if using minibatching)
         
         # [d, k, 2], [d, d], [n_grad_mc_samples, d, d], [1,], [1,] -> [n_grad_mc_samples, d, k, 2]
-        grad_z = vmap(grad(self.log_joint_prob_soft, 0), (None, None, 0, None, None, None), 0)(single_z, single_theta, eps, t, subk_, data)
+        grad_z = vmap(grad(self.log_joint_prob_soft, 0), (None, None, 0, None, None), 0)(single_z, single_theta, eps, t, subk_)
 
         # stable computation of exp/log/divide
         # [d, k, 2], [d, k, 2]
